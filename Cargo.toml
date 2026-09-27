@@ -1,0 +1,19 @@
+[package]
+name = "tit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A minimalist, opinionated terminal UI for git"
+license = "MIT"
+repository = "https://github.com/Jijjy/tit"
+readme = "README.md"
+keywords = ["git", "tui", "terminal", "diff"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+
+[dependencies]
+ratatui = "0.30.2"
+similar = "3.2.0"
+syntect = "5.3.0"
+two-face = "0.5.2"
+unicode-width = "0.2"
