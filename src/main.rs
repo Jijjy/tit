@@ -1631,7 +1631,8 @@ impl App {
 
     /// Renders `ents` (sorted) as the folder tree; `cur` is highlighted with its folders.
     /// `color` shows staged state; otherwise new files are green and deleted ones red.
-    fn tree_lines(&self, ents: &[&Entry], cur: Option<&Entry>, color: bool) -> Vec<Line<'static>> {
+    /// One line per folder, its files wrapped to `width` and aligned under the first.
+    fn tree_lines(&self, ents: &[&Entry], cur: Option<&Entry>, color: bool, width: usize) -> Vec<Line<'static>> {
         let cur_dirs = cur.map(|e| e.dirs());
         let ancestor = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
         let mut lines = vec![];
@@ -1658,10 +1659,10 @@ impl App {
                 });
             }
             spans.push(Span::raw(" / "));
+            let indent = Line::from(spans.clone()).width();
+            let mut used = indent;
             for (n, e) in ents[i..j].iter().enumerate() {
-                if n > 0 {
-                    spans.push(Span::raw(", "));
-                }
+                let mut file = vec![];
                 let mut st = match (color, e.staged(), e.unstaged()) {
                     _ if e.is_conflict() => Style::new().fg(Color::Magenta),
                     (true, true, false) => Style::new().fg(Color::Green),
@@ -1673,15 +1674,29 @@ impl App {
                 if cur.is_some_and(|c| std::ptr::eq(c, *e)) {
                     st = st.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
-                spans.push(Span::styled(e.name().to_string(), st));
+                file.push(Span::styled(e.name().to_string(), st));
                 if let Some((add, del)) = e.stat {
                     if add > 0 {
-                        spans.push(Span::styled(format!(" +{add}"), Style::new().fg(Color::Green)));
+                        file.push(Span::styled(format!(" +{add}"), Style::new().fg(Color::Green)));
                     }
                     if del > 0 {
-                        spans.push(Span::styled(format!(" -{del}"), Style::new().fg(Color::Red)));
+                        file.push(Span::styled(format!(" -{del}"), Style::new().fg(Color::Red)));
                     }
                 }
+                let fw = Line::from(file.clone()).width();
+                if n > 0 {
+                    spans.push(Span::raw(","));
+                    if used + 2 + fw > width {
+                        lines.push(Line::from(std::mem::take(&mut spans)));
+                        spans.push(Span::raw(" ".repeat(indent)));
+                        used = indent;
+                    } else {
+                        spans.push(Span::raw(" "));
+                        used += 2;
+                    }
+                }
+                spans.extend(file);
+                used += fw;
             }
             lines.push(Line::from(spans));
             prev = Some(dirs);
@@ -1697,7 +1712,7 @@ impl App {
             return;
         }
         let tree = |ents: &[Entry], cur: Option<&Entry>, empty: &str| {
-            let t = self.tree_lines(&ents.iter().collect::<Vec<_>>(), cur, self.mode != Mode::Commit);
+            let t = self.tree_lines(&ents.iter().collect::<Vec<_>>(), cur, self.mode != Mode::Commit, (w as usize).saturating_sub(9));
             if t.is_empty() { vec![Line::from(empty.to_string())] } else { t }
         };
         let head = match self.mode {
@@ -1790,7 +1805,9 @@ impl App {
             let (title, footer, items): (String, _, Vec<Line>) = match self.mode {
                 Mode::History => {
                     let hist = self.log_files.iter().find(|e| Some(&e.path) == self.hist_file.as_ref());
-                    let mut files = self.tree_lines(&self.log_files.iter().collect::<Vec<_>>(), hist, false);
+                    // Width inside the modal border and label.
+                    let fw = (w.saturating_sub(4).min(100) as usize).saturating_sub(11);
+                    let mut files = self.tree_lines(&self.log_files.iter().collect::<Vec<_>>(), hist, false, fw);
                     if files.is_empty() {
                         files.push(Line::from("(no changes)"));
                     }
@@ -1877,7 +1894,7 @@ impl App {
 
         if let Some(text) = &self.commit {
             let pw = w.saturating_sub(4).min(80);
-            let mut files = self.tree_lines(&self.to_commit(), None, false);
+            let mut files = self.tree_lines(&self.to_commit(), None, false, (pw as usize).saturating_sub(11));
             if files.is_empty() {
                 files.push(Line::from("(message only)"));
             }
