@@ -372,6 +372,25 @@ fn sort_entries(v: &mut [Entry]) {
 }
 
 /// Prefixes `lines` with a header label column: `LABEL │ `, blank label after the first line.
+/// At most `max` lines around line `at`, with a note in place of each hidden run.
+fn crop(mut lines: Vec<Line<'static>>, at: usize, max: usize) -> Vec<Line<'static>> {
+    if lines.len() <= max {
+        return lines;
+    }
+    let start = at.saturating_sub(max / 2).min(lines.len() - max);
+    let (above, below) = (start, lines.len() - start - max);
+    lines.truncate(start + max);
+    lines.drain(..start);
+    let more = |n| Line::styled(format!("… {n} more"), Style::new().fg(Color::DarkGray));
+    if above > 0 {
+        lines[0] = more(above + 1);
+    }
+    if below > 0 {
+        lines[max - 1] = more(below + 1);
+    }
+    lines
+}
+
 fn labeled(name: &str, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
         .into_iter()
@@ -1632,11 +1651,13 @@ impl App {
     /// Renders `ents` (sorted) as the folder tree; `cur` is highlighted with its folders.
     /// `color` shows staged state; otherwise new files are green and deleted ones red.
     /// One line per folder, its files wrapped to `width` and aligned under the first.
-    fn tree_lines(&self, ents: &[&Entry], cur: Option<&Entry>, color: bool, width: usize) -> Vec<Line<'static>> {
+    /// Also returns the line that holds `cur`.
+    fn tree_lines(&self, ents: &[&Entry], cur: Option<&Entry>, color: bool, width: usize) -> (Vec<Line<'static>>, usize) {
         let cur_dirs = cur.map(|e| e.dirs());
         let ancestor = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
         let mut lines = vec![];
         let mut prev: Option<Vec<&str>> = None;
+        let mut cur_line = 0;
         let mut i = 0;
         while i < ents.len() {
             let dirs = ents[i].dirs();
@@ -1671,7 +1692,8 @@ impl App {
                     (false, ..) if e.is_deleted() => Style::new().fg(Color::Red),
                     _ => Style::new(),
                 };
-                if cur.is_some_and(|c| std::ptr::eq(c, *e)) {
+                let is_cur = cur.is_some_and(|c| std::ptr::eq(c, *e));
+                if is_cur {
                     st = st.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
                 file.push(Span::styled(e.name().to_string(), st));
@@ -1695,6 +1717,9 @@ impl App {
                         used += 2;
                     }
                 }
+                if is_cur {
+                    cur_line = lines.len();
+                }
                 spans.extend(file);
                 used += fw;
             }
@@ -1702,7 +1727,7 @@ impl App {
             prev = Some(dirs);
             i = j;
         }
-        lines
+        (lines, cur_line)
     }
 
     fn draw(&mut self, f: &mut Frame) {
@@ -1712,8 +1737,8 @@ impl App {
             return;
         }
         let tree = |ents: &[Entry], cur: Option<&Entry>, empty: &str| {
-            let t = self.tree_lines(&ents.iter().collect::<Vec<_>>(), cur, self.mode != Mode::Commit, (w as usize).saturating_sub(9));
-            if t.is_empty() { vec![Line::from(empty.to_string())] } else { t }
+            let (t, at) = self.tree_lines(&ents.iter().collect::<Vec<_>>(), cur, self.mode != Mode::Commit, (w as usize).saturating_sub(9));
+            if t.is_empty() { vec![Line::from(empty.to_string())] } else { crop(t, at, (h as usize / 3).max(3)) }
         };
         let head = match self.mode {
             Mode::Status | Mode::History | Mode::Branches | Mode::Files => [
@@ -1807,7 +1832,7 @@ impl App {
                     let hist = self.log_files.iter().find(|e| Some(&e.path) == self.hist_file.as_ref());
                     // Width inside the modal border and label.
                     let fw = (w.saturating_sub(4).min(100) as usize).saturating_sub(11);
-                    let mut files = self.tree_lines(&self.log_files.iter().collect::<Vec<_>>(), hist, false, fw);
+                    let mut files = self.tree_lines(&self.log_files.iter().collect::<Vec<_>>(), hist, false, fw).0;
                     if files.is_empty() {
                         files.push(Line::from("(no changes)"));
                     }
@@ -1894,7 +1919,7 @@ impl App {
 
         if let Some(text) = &self.commit {
             let pw = w.saturating_sub(4).min(80);
-            let mut files = self.tree_lines(&self.to_commit(), None, false, (pw as usize).saturating_sub(11));
+            let mut files = self.tree_lines(&self.to_commit(), None, false, (pw as usize).saturating_sub(11)).0;
             if files.is_empty() {
                 files.push(Line::from("(message only)"));
             }
@@ -2284,5 +2309,15 @@ mod tests {
             .collect();
         assert_eq!(shape, ["Ca\n", "Xours1\n|theirs1\n", "Cb\n", "X|theirs2\n", "Cc\n"]);
         assert!(parse_conflicts("no markers\n").is_none());
+    }
+
+    #[test]
+    fn crop_keeps_current_line_and_notes_hidden() {
+        let lines: Vec<Line<'static>> = (0..10).map(|i| Line::from(i.to_string())).collect();
+        let text = |ls: Vec<Line<'static>>| ls.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(text(crop(lines.clone(), 5, 4)), ["… 4 more", "4", "5", "… 4 more"]);
+        assert_eq!(text(crop(lines.clone(), 0, 4)), ["0", "1", "2", "… 7 more"]);
+        assert_eq!(text(crop(lines.clone(), 9, 4)), ["… 7 more", "7", "8", "9"]);
+        assert_eq!(crop(lines, 0, 10).len(), 10);
     }
 }
