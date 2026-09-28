@@ -14,7 +14,7 @@ cargo install tit
 
 Needs git 2.30 or later on `PATH`. tit drives the git CLI directly and does not use libgit2.
 
-Tested on Linux only. It builds on macOS, but I don't care about Mac, so it has never been run there.
+Tested on Linux only. It builds on macOS and Windows but has never been run on either. I don't care about Mac.
 
 ## Use
 
