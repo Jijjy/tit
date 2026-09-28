@@ -2212,9 +2212,13 @@ fn to_style(s: highlighting::Style) -> Style {
 
 fn main() -> Result<(), Box<dyn Error>> {
     match std::env::args().nth(1).as_deref() {
-        Some("-V" | "--version") => return Ok(println!("tit {}", env!("CARGO_PKG_VERSION"))),
+        Some("-V" | "--version") => {
+            println!("tit {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some("-h" | "--help") => {
-            return Ok(println!("{}\n\nUsage: tit\n\nRun it inside a git repository. Press ? for keys.", env!("CARGO_PKG_DESCRIPTION")));
+            println!("{}\n\nUsage: tit\n\nRun it inside a git repository. Press ? for keys.", env!("CARGO_PKG_DESCRIPTION"));
+            return Ok(());
         }
         _ => {}
     }
