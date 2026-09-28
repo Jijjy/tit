@@ -2112,17 +2112,22 @@ impl App {
     }
 
     fn run(&mut self, term: &mut DefaultTerminal) -> std::io::Result<()> {
-        let mut sig = self.signature();
+        let mut sig = signature(&self.root, &self.paths());
         let mut checked = Instant::now();
+        let mut checking: Option<Receiver<String>> = None;
         loop {
             term.draw(|f| self.draw(f))?;
-            let wait = if self.busy.is_some() || self.queued.is_some() { 100 } else { 500 };
-            if event::poll(Duration::from_millis(wait))?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-                && !self.key(k)
-            {
-                return Ok(());
+            let wait = if self.busy.is_some() || self.queued.is_some() || checking.is_some() { 100 } else { 500 };
+            // Handle every key already queued before drawing again, so held keys don't lag.
+            let mut wait = Duration::from_millis(wait);
+            while event::poll(wait)? {
+                wait = Duration::ZERO;
+                if let Event::Key(k) = event::read()?
+                    && k.kind == KeyEventKind::Press
+                    && !self.key(k)
+                {
+                    return Ok(());
+                }
             }
             if let Some(rx) = &self.busy
                 && let Ok(out) = rx.try_recv()
@@ -2137,30 +2142,41 @@ impl App {
             }
             // A failed fetch (offline, no access) just waits for the next one.
             self.start_fetch(Duration::from_secs(300));
-            if self.mode == Mode::Status && self.busy.is_none() && checked.elapsed() >= Duration::from_secs(1) {
+            // git status is slow on Windows, so the check runs off the UI thread.
+            if let Some(rx) = &checking
+                && let Ok(now) = rx.try_recv()
+            {
+                checking = None;
                 checked = Instant::now();
-                let now = self.signature();
-                if now != sig {
+                if now != sig && self.mode == Mode::Status && self.busy.is_none() {
                     sig = now;
                     self.refresh();
                 }
             }
+            if checking.is_none() && self.mode == Mode::Status && self.busy.is_none() && checked.elapsed() >= Duration::from_secs(1) {
+                let (tx, rx) = mpsc::channel();
+                let (root, paths) = (self.root.clone(), self.paths());
+                std::thread::spawn(move || _ = tx.send(signature(&root, &paths)));
+                checking = Some(rx);
+            }
         }
     }
 
-    /// Changes when the repo state or any changed file does: branch, HEAD, upstream,
-    /// status, and each listed file's mtime and size.
-    // chisle: polling; switch to a file watcher if one git status per second is too slow.
-    fn signature(&self) -> String {
-        let mut sig = self
-            .git(&["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])
-            .unwrap_or_default();
-        for e in &self.entries {
-            let m = std::fs::metadata(self.root.join(&e.path)).ok();
-            sig += &format!("{:?}", m.map(|m| (m.modified().ok(), m.len())));
-        }
-        sig
+    fn paths(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.path.clone()).collect()
     }
+}
+
+/// Changes when the repo state or any changed file does: branch, HEAD, upstream,
+/// status, and each listed file's mtime and size.
+// chisle: polling; switch to a file watcher if one git status per second is too slow.
+fn signature(root: &Path, paths: &[String]) -> String {
+    let mut sig = git(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default();
+    for p in paths {
+        let m = std::fs::metadata(root.join(p)).ok();
+        sig += &format!("{:?}", m.map(|m| (m.modified().ok(), m.len())));
+    }
+    sig
 }
 
 /// Splits a line into pieces at most `width` columns wide.
