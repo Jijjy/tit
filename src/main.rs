@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
     collections::HashMap,
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        OnceLock,
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant},
 };
 
@@ -61,15 +64,20 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Fetches all remotes for the background refresh. Nobody asked for it, so ssh
-/// must not stop to ask for a passphrase or a host key.
-fn background_fetch(root: &Path) -> Result<Vec<u8>, String> {
+/// must not stop to ask for a passphrase or a host key. True if any remote ref moved.
+fn background_fetch(root: &Path) -> bool {
+    if git(root, &["remote"]).unwrap_or_default().is_empty() {
+        return false;
+    }
+    let refs = || git(root, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes"]).ok();
+    let before = refs();
     let ssh = std::env::var("GIT_SSH_COMMAND")
         .ok()
         .or_else(|| git(root, &["config", "core.sshCommand"]).ok())
         .unwrap_or_else(|| "ssh".into());
     let mut cmd = git_cmd(root, &["fetch", "--all", "--prune", "--quiet"]);
     cmd.env("GIT_SSH_COMMAND", format!("{ssh} -o BatchMode=yes"));
-    run_git(cmd)
+    run_git(cmd).is_ok() && refs() != before
 }
 
 #[derive(Clone)]
@@ -106,7 +114,7 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Diff {
     /// (old line, new line, changed)
     rows: Vec<(Option<usize>, Option<usize>, bool)>,
@@ -203,7 +211,9 @@ struct Outcome {
 
 /// The rebase, merge, cherry-pick or revert stopped part way, as its git command.
 fn current_op(root: &Path) -> Option<&'static str> {
-    let gd = PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"]).ok()?);
+    // The git dir never moves while tit runs, so look it up once.
+    static GIT_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let gd = GIT_DIR.get_or_init(|| git(root, &["rev-parse", "--absolute-git-dir"]).ok().map(PathBuf::from)).as_ref()?;
     [
         ("rebase-merge", "rebase"),
         ("rebase-apply", "rebase"),
@@ -337,8 +347,14 @@ fn git_err(err: &str) -> String {
     line.or(err.lines().last()).unwrap_or("git failed").to_string()
 }
 
+/// Which history: revision and file, None for the current branch and all files.
+type LogKey = (Option<String>, Option<String>);
+
+#[derive(Clone)]
 struct LogEntry {
     sha: String,
+    /// First parent; None for a root commit.
+    parent: Option<String>,
     short: String,
     subject: String,
     author: String,
@@ -363,6 +379,80 @@ fn numstat(raw: &str) -> HashMap<String, Option<(usize, usize)>> {
             p
         };
         out.insert(path.to_string(), a.parse().ok().zip(d.parse().ok()));
+    }
+    out
+}
+
+/// Commits of `rev` (default: HEAD), optionally only those touching `file`.
+fn read_log(root: &Path, rev: Option<&str>, file: Option<&str>) -> Vec<LogEntry> {
+    let mut args = vec!["log", "-n", "1000", "--date=format:%y-%m-%d %H:%M", "--format=%H%x1f%P%x1f%h%x1f%s%x1f%an%x1f%ad"];
+    args.extend(rev);
+    if let Some(f) = file {
+        args.extend(["--follow", "--", f]);
+    }
+    // chisle: last 1000 commits; page in more if anyone scrolls that far.
+    git(root, &args)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.split('\x1f').collect();
+            let [sha, parents, short, subject, author, date] = p[..] else { return None };
+            let s = |x: &str| x.to_string();
+            let parent = parents.split(' ').next().filter(|p| !p.is_empty()).map(s);
+            Some(LogEntry { sha: s(sha), parent, short: s(short), subject: s(subject), author: s(author), date: s(date) })
+        })
+        .collect()
+}
+
+/// Files changed by `sha` against its first parent, in one git call.
+fn commit_entries(root: &Path, sha: &str, parent: Option<&str>) -> Vec<Entry> {
+    let mut args = vec!["diff-tree", "-r", "-z", "-M", "--raw", "--numstat", "--no-commit-id"];
+    args.extend(match parent {
+        Some(p) => [p, sha],
+        None => ["--root", sha],
+    });
+    let raw = git(root, &args).unwrap_or_default();
+    // Raw records (":modes shas status", path[, new path]) come first, then numstat.
+    let mut fields = raw.split('\0').peekable();
+    let mut out = vec![];
+    while let Some(rec) = fields.next_if(|f| f.starts_with(':')) {
+        let x = rec.rsplit(' ').next().and_then(|st| st.bytes().next()).unwrap_or(b'M');
+        let p = fields.next().unwrap_or("").to_string();
+        let (orig, path) = match x {
+            b'R' | b'C' => (Some(p), fields.next().unwrap_or("").to_string()),
+            _ => (None, p),
+        };
+        out.push(Entry { path, orig, x, y: b' ', stat: None });
+    }
+    let stats = numstat(&fields.collect::<Vec<_>>().join("\0"));
+    for e in &mut out {
+        e.stat = stats.get(&e.path).copied().flatten();
+    }
+    sort_entries(&mut out);
+    out
+}
+
+/// Parses `status --porcelain=v2 -z` entries.
+fn status_entries(raw: &str) -> Vec<Entry> {
+    let mut fields = raw.split('\0');
+    let mut out = vec![];
+    while let Some(f) = fields.next() {
+        // Space-separated fields before the path, which may itself hold spaces.
+        let n = match f.as_bytes().first() {
+            Some(b'1') => 9,
+            Some(b'2') => 10,
+            Some(b'u') => 11,
+            Some(b'?') => {
+                out.push(Entry { path: f[2..].to_string(), orig: None, x: b'?', y: b'?', stat: None });
+                continue;
+            }
+            _ => continue,
+        };
+        let parts: Vec<&str> = f.splitn(n, ' ').collect();
+        let [_, xy, .., path] = parts[..] else { continue };
+        let [x, y] = [xy.as_bytes()[0], xy.as_bytes()[1]].map(|c| if c == b'.' { b' ' } else { c });
+        let orig = f.starts_with('2').then(|| fields.next().unwrap_or("").to_string());
+        out.push(Entry { path: path.to_string(), orig, x, y, stat: None });
     }
     out
 }
@@ -448,6 +538,16 @@ struct App {
     hist_file: Option<String>,
     /// Files changed by the selected log entry.
     log_files: Vec<Entry>,
+    /// Logs by (rev, file), shown at once while a fresh one loads in `log_rx`.
+    log_cache: HashMap<LogKey, Vec<LogEntry>>,
+    log_rx: Option<Receiver<(LogKey, Vec<LogEntry>)>>,
+    /// Files of each commit seen; one commit's load at a time runs in `files_rx`.
+    files_cache: HashMap<String, Vec<Entry>>,
+    files_rx: Option<Receiver<(String, Vec<Entry>)>>,
+    /// Repo state the last refresh saw, from `signature`.
+    sig: String,
+    /// Working tree entries, file, diff and scroll to restore when leaving a commit.
+    saved: Option<(Vec<Entry>, usize, Diff, usize)>,
     diff: Diff,
     /// Diff rows wrapped to the screen width in `vis_width`; rebuilt when it changes.
     vis: Vec<VisRow>,
@@ -478,7 +578,7 @@ struct App {
     /// Commit popup is amending HEAD: its original subject, and whether HEAD is pushed.
     amend: Option<(String, bool)>,
     /// Background fetch running, and when the last one started.
-    fetching: Option<Receiver<Result<Vec<u8>, String>>>,
+    fetching: Option<Receiver<bool>>,
     last_fetch: Option<Instant>,
     /// Steps (and their labels) waiting for the fetch to finish.
     queued: Option<(Vec<Step>, String, String)>,
@@ -511,6 +611,12 @@ impl App {
             files: vec![],
             hist_file: None,
             log_files: vec![],
+            log_cache: HashMap::new(),
+            log_rx: None,
+            files_cache: HashMap::new(),
+            files_rx: None,
+            saved: None,
+            sig: String::new(),
             diff: Diff::default(),
             vis: vec![],
             vis_width: 0,
@@ -542,6 +648,8 @@ impl App {
         let saved = app.git(&["config", "--get", "tit.layout"]).unwrap_or_default();
         app.layout = LAYOUTS.iter().find(|l| l.1 == saved).map_or(Layout::Hybrid, |l| l.0);
         app.refresh();
+        // Load the branch's history now so the first h is instant.
+        app.start_log_load();
         app
     }
 
@@ -550,9 +658,16 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        let st = self.git(&["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default();
+        self.refresh_from(&st);
+    }
+
+    /// Reloads everything from `status --porcelain=v2 --branch -z --untracked-files=all` output.
+    fn refresh_from(&mut self, st: &str) {
         let prev = self.entries.get(self.cur).map(|e| e.path.clone());
-        self.load_status();
-        self.load_entries();
+        let has_head = self.parse_head(st);
+        self.load_entries(st, has_head);
+        self.sig = signature_of(&self.root, st, &self.paths());
         // No partial staging: a staged file edited since gets its new version staged.
         let partial: Vec<String> = self
             .entries
@@ -565,7 +680,9 @@ impl App {
             if let Err(err) = self.git(&args) {
                 self.msg = git_err(&err);
             }
-            self.load_entries();
+            let st = self.git(&["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default();
+            self.load_entries(&st, has_head);
+            self.sig = signature_of(&self.root, &st, &self.paths());
         }
 
         let same = prev.as_deref().and_then(|p| self.entries.iter().position(|e| e.path == p));
@@ -573,46 +690,55 @@ impl App {
         self.load_diff(same.is_none());
     }
 
-    /// Branch name and the STATUS line: upstream, ahead/behind, any stopped operation.
     fn load_status(&mut self) {
-        self.branch = match self.git(&["branch", "--show-current"]) {
-            Ok(b) if !b.is_empty() => b,
-            _ => self.git(&["rev-parse", "--short", "HEAD"]).unwrap_or("(no commits)".into()),
+        let st = self.git(&["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=no"]).unwrap_or_default();
+        self.parse_head(&st);
+    }
+
+    /// Branch name and the STATUS line (upstream, ahead/behind, any stopped operation)
+    /// from porcelain v2 headers. True if there is a HEAD commit.
+    fn parse_head(&mut self, st: &str) -> bool {
+        let (mut oid, mut head, mut up, mut ab) = ("", "", None, None);
+        for h in st.split('\0').filter_map(|r| r.strip_prefix("# ")) {
+            match h.split_once(' ') {
+                Some(("branch.oid", v)) => oid = v,
+                Some(("branch.head", v)) => head = v,
+                Some(("branch.upstream", v)) => up = Some(v),
+                Some(("branch.ab", v)) => ab = Some(v),
+                _ => {}
+            }
+        }
+        let has_head = !oid.is_empty() && oid != "(initial)";
+        self.branch = match head {
+            "" | "(detached)" if has_head => oid[..7.min(oid.len())].to_string(),
+            "" | "(detached)" => "(no commits)".into(),
+            b => b.to_string(),
         };
-        self.status = match self.git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
-            Ok(up) => {
+        // No ahead/behind means the upstream is gone.
+        self.status = match up.zip(ab) {
+            Some((up, ab)) => {
                 let mut s = format!("{} -> {up}", self.branch);
-                if let Ok(c) = self.git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"]) {
-                    let mut it = c.split_whitespace();
-                    let (a, b) = (it.next().unwrap_or("0"), it.next().unwrap_or("0"));
-                    if a != "0" {
-                        s += &format!(" ↑{a}");
-                    }
-                    if b != "0" {
-                        s += &format!(" ↓{b}");
-                    }
+                let mut it = ab.split(' ').map(|n| &n[1..]);
+                let (a, b) = (it.next().unwrap_or("0"), it.next().unwrap_or("0"));
+                if a != "0" {
+                    s += &format!(" ↑{a}");
+                }
+                if b != "0" {
+                    s += &format!(" ↓{b}");
                 }
                 s
             }
-            Err(_) => format!("{} (no upstream)", self.branch),
+            None => format!("{} (no upstream)", self.branch),
         };
         if let Some(op) = current_op(&self.root) {
             self.status += &format!(" ── {op} in progress, r to finish or abort");
         }
+        has_head
     }
 
-    fn load_entries(&mut self) {
-        let raw = self
-            .git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-            .unwrap_or_default();
-        let mut fields = raw.split('\0').filter(|f| f.len() > 3);
-        self.entries.clear();
-        while let Some(f) = fields.next() {
-            let b = f.as_bytes();
-            let orig = matches!(b[0], b'R' | b'C').then(|| fields.next().unwrap_or("").to_string());
-            self.entries.push(Entry { path: f[3..].to_string(), orig, x: b[0], y: b[1], stat: None });
-        }
-        let base = if self.git(&["rev-parse", "-q", "--verify", "HEAD"]).is_ok() { "HEAD" } else { EMPTY_TREE };
+    fn load_entries(&mut self, st: &str, has_head: bool) {
+        self.entries = status_entries(st);
+        let base = if has_head { "HEAD" } else { EMPTY_TREE };
         let stats = numstat(&self.git(&["diff", base, "-M", "--numstat", "-z"]).unwrap_or_default());
         for e in &mut self.entries {
             e.stat = if e.x == b'?' {
@@ -631,10 +757,19 @@ impl App {
     fn open_history(&mut self, rev: Option<String>, file: Option<String>) {
         let old_rev = std::mem::replace(&mut self.hist_rev, rev);
         let old_file = std::mem::replace(&mut self.hist_file, file);
-        if !self.load_log() {
-            (self.hist_rev, self.hist_file) = (old_rev, old_file);
-            self.msg = "no commits".into();
-            return;
+        // Show the last log for this at once, and load a fresh one behind it.
+        let key = (self.hist_rev.clone(), self.hist_file.clone());
+        if let Some(log) = self.log_cache.get(&key) {
+            self.log = log.clone();
+            self.start_log_load();
+        } else {
+            self.log = read_log(&self.root, key.0.as_deref(), key.1.as_deref());
+            if self.log.is_empty() {
+                (self.hist_rev, self.hist_file) = (old_rev, old_file);
+                self.msg = "no commits".into();
+                return;
+            }
+            self.log_cache.insert(key, self.log.clone());
         }
         self.mode = Mode::History;
         self.sel = 0;
@@ -645,24 +780,29 @@ impl App {
     }
 
     /// Reads `log` for `hist_rev` and `hist_file`; false when there are no commits.
-    fn load_log(&mut self) -> bool {
-        let mut args = vec!["log", "-n", "1000", "--date=format:%y-%m-%d %H:%M", "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ad"];
-        args.extend(self.hist_rev.as_deref());
-        if let Some(f) = &self.hist_file {
-            args.extend(["--follow", "--", f]);
+    fn start_log_load(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        let (root, key) = (self.root.clone(), (self.hist_rev.clone(), self.hist_file.clone()));
+        std::thread::spawn(move || {
+            let log = read_log(&root, key.0.as_deref(), key.1.as_deref());
+            _ = tx.send((key, log));
+        });
+        self.log_rx = Some(rx);
+    }
+
+    /// Takes a fresh log: cached, and shown if the history modal still lists it.
+    fn finish_log(&mut self, key: LogKey, log: Vec<LogEntry>) {
+        self.log_rx = None;
+        if log.is_empty() {
+            return;
         }
-        let raw = self.git(&args).unwrap_or_default();
-        // chisle: last 1000 commits; page in more if anyone scrolls that far.
-        self.log = raw
-            .lines()
-            .filter_map(|l| {
-                let p: Vec<&str> = l.split('\x1f').collect();
-                let [sha, short, subject, author, date] = p[..] else { return None };
-                let s = |x: &str| x.to_string();
-                Some(LogEntry { sha: s(sha), short: s(short), subject: s(subject), author: s(author), date: s(date) })
-            })
-            .collect();
-        !self.log.is_empty()
+        self.log_cache.insert(key.clone(), log.clone());
+        if self.mode == Mode::History && key == (self.hist_rev.clone(), self.hist_file.clone()) {
+            let sha = self.log.get(self.sel).map(|c| c.sha.clone());
+            self.log = log;
+            self.sel = self.log.iter().position(|c| Some(&c.sha) == sha.as_ref()).unwrap_or(0);
+            self.filter();
+        }
     }
 
     fn open_files(&mut self) {
@@ -708,12 +848,7 @@ impl App {
                 self.filter();
                 self.move_to(pos);
             }
-            Mode::History => {
-                let sha = self.log.get(self.sel).map(|c| c.sha.clone());
-                self.load_log();
-                self.sel = self.log.iter().position(|c| Some(&c.sha) == sha.as_ref()).unwrap_or(0);
-                self.filter();
-            }
+            Mode::History => self.start_log_load(),
             _ => {}
         }
     }
@@ -724,19 +859,18 @@ impl App {
             return;
         }
         self.last_fetch = Some(Instant::now());
-        if self.git(&["remote"]).unwrap_or_default().is_empty() {
-            return;
-        }
         let (tx, rx) = mpsc::channel();
         let root = self.root.clone();
         std::thread::spawn(move || _ = tx.send(background_fetch(&root)));
         self.fetching = Some(rx);
     }
 
-    fn finish_fetch(&mut self) {
+    fn finish_fetch(&mut self, moved: bool) {
         self.fetching = None;
-        self.load_status();
-        self.reload_list();
+        if moved {
+            self.load_status();
+            self.reload_list();
+        }
         if let Some((steps, label, done)) = self.queued.take() {
             self.start_steps(steps, &label, &done);
         }
@@ -798,43 +932,48 @@ impl App {
             return;
         }
         self.sel = self.shown[self.pos];
-        self.log_files = self.commit_entries(&self.log[self.sel].sha);
+        match self.files_cache.get(&self.log[self.sel].sha) {
+            Some(files) => self.log_files = files.clone(),
+            None => {
+                self.log_files.clear();
+                self.start_files_load();
+            }
+        }
+    }
+
+    /// Loads the selected commit's files in the background, one commit at a time,
+    /// so arrowing through history never waits on git.
+    fn start_files_load(&mut self) {
+        let Some(c) = self.log.get(self.sel) else { return };
+        if self.files_rx.is_some() || self.files_cache.contains_key(&c.sha) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (root, sha, parent) = (self.root.clone(), c.sha.clone(), c.parent.clone());
+        std::thread::spawn(move || _ = tx.send((sha.clone(), commit_entries(&root, &sha, parent.as_deref()))));
+        self.files_rx = Some(rx);
+    }
+
+    fn finish_files(&mut self, sha: String, files: Vec<Entry>) {
+        self.files_rx = None;
+        self.files_cache.insert(sha, files);
+        if self.mode == Mode::History {
+            self.move_to(self.pos);
+        }
     }
 
     fn open_commit(&mut self) {
+        let c = &self.log[self.sel];
+        if !self.files_cache.contains_key(&c.sha) {
+            self.log_files = commit_entries(&self.root, &c.sha, c.parent.as_deref());
+            self.files_cache.insert(c.sha.clone(), self.log_files.clone());
+        }
         self.mode = Mode::Commit;
-        self.entries = self.log_files.clone();
+        let entries = std::mem::replace(&mut self.entries, self.log_files.clone());
+        self.saved = Some((entries, self.cur, std::mem::take(&mut self.diff), self.scroll));
         // Open on the file whose history this is; older commits may have it under another name.
         self.cur = self.entries.iter().position(|e| Some(&e.path) == self.hist_file.as_ref()).unwrap_or(0);
         self.load_diff(true);
-    }
-
-    /// Files changed by `sha` against its first parent.
-    fn commit_entries(&self, sha: &str) -> Vec<Entry> {
-        let parent = format!("{sha}^");
-        let range: &[&str] = if self.git(&["rev-parse", "-q", "--verify", &parent]).is_ok() {
-            &[&parent, sha]
-        } else {
-            &["--root", "--no-commit-id", sha]
-        };
-        let run = |fmt: &str| {
-            self.git(&[&["diff-tree", "-r", "-z", "-M", fmt][..], range].concat()).unwrap_or_default()
-        };
-        let stats = numstat(&run("--numstat"));
-        let raw = run("--name-status");
-        let mut fields = raw.split('\0').filter(|f| !f.is_empty());
-        let mut out = vec![];
-        while let (Some(st), Some(p)) = (fields.next(), fields.next()) {
-            let x = st.as_bytes()[0];
-            let (orig, path) = match x {
-                b'R' | b'C' => (Some(p.to_string()), fields.next().unwrap_or("").to_string()),
-                _ => (None, p.to_string()),
-            };
-            let stat = stats.get(&path).copied().flatten();
-            out.push(Entry { path, orig, x, y: b' ', stat });
-        }
-        sort_entries(&mut out);
-        out
     }
 
     fn select(&mut self, i: usize) {
@@ -1548,10 +1687,8 @@ impl App {
                     self.query.clear();
                     self.filter();
                 }
-                KeyCode::Esc => {
-                    self.mode = Mode::Status;
-                    self.refresh();
-                }
+                // The working tree view underneath is unchanged; the status poll catches up.
+                KeyCode::Esc => self.mode = Mode::Status,
                 KeyCode::Backspace => {
                     self.query.pop();
                     self.filter();
@@ -1573,7 +1710,10 @@ impl App {
             (Mode::Status, KeyCode::Esc) => return false,
             (Mode::Commit, KeyCode::Esc | KeyCode::Char('h')) => {
                 self.mode = Mode::History;
-                self.refresh();
+                if let Some((entries, cur, diff, scroll)) = self.saved.take() {
+                    (self.entries, self.cur, self.diff, self.scroll) = (entries, cur, diff, scroll);
+                    self.vis_width = 0;
+                }
             }
             (Mode::Status, KeyCode::Char('h')) => self.open_history(None, None),
             (Mode::Status, KeyCode::Char('H')) => match self.entries.get(self.cur) {
@@ -2154,12 +2294,12 @@ impl App {
     }
 
     fn run(&mut self, term: &mut DefaultTerminal) -> std::io::Result<()> {
-        let mut sig = signature(&self.root, &self.paths());
         let mut checked = Instant::now();
-        let mut checking: Option<Receiver<String>> = None;
+        let mut checking: Option<Receiver<(String, String)>> = None;
         loop {
             term.draw(|f| self.draw(f))?;
-            let wait = if self.busy.is_some() || self.queued.is_some() || checking.is_some() { 100 } else { 500 };
+            let loading = self.log_rx.is_some() || self.files_rx.is_some();
+            let wait = if self.busy.is_some() || self.queued.is_some() || checking.is_some() || loading { 50 } else { 500 };
             // Handle every key already queued before drawing again, so held keys don't lag.
             let mut wait = Duration::from_millis(wait);
             while event::poll(wait)? {
@@ -2178,21 +2318,30 @@ impl App {
                 self.finish_steps(out);
             }
             if let Some(rx) = &self.fetching
-                && rx.try_recv().is_ok()
+                && let Ok(moved) = rx.try_recv()
             {
-                self.finish_fetch();
+                self.finish_fetch(moved);
+            }
+            if let Some(rx) = &self.log_rx
+                && let Ok((key, log)) = rx.try_recv()
+            {
+                self.finish_log(key, log);
+            }
+            if let Some(rx) = &self.files_rx
+                && let Ok((sha, files)) = rx.try_recv()
+            {
+                self.finish_files(sha, files);
             }
             // A failed fetch (offline, no access) just waits for the next one.
             self.start_fetch(Duration::from_secs(300));
             // git status is slow on Windows, so the check runs off the UI thread.
             if let Some(rx) = &checking
-                && let Ok(now) = rx.try_recv()
+                && let Ok((now, st)) = rx.try_recv()
             {
                 checking = None;
                 checked = Instant::now();
-                if now != sig && self.mode == Mode::Status && self.busy.is_none() {
-                    sig = now;
-                    self.refresh();
+                if now != self.sig && self.mode == Mode::Status && self.busy.is_none() {
+                    self.refresh_from(&st);
                 }
             }
             if checking.is_none() && self.mode == Mode::Status && self.busy.is_none() && checked.elapsed() >= Duration::from_secs(1) {
@@ -2212,8 +2361,14 @@ impl App {
 /// Changes when the repo state or any changed file does: branch, HEAD, upstream,
 /// status, and each listed file's mtime and size.
 // chisle: polling; switch to a file watcher if one git status per second is too slow.
-fn signature(root: &Path, paths: &[String]) -> String {
-    let mut sig = git(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default();
+/// Also returns the status output, which `refresh_from` takes.
+fn signature(root: &Path, paths: &[String]) -> (String, String) {
+    let st = git(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default();
+    (signature_of(root, &st, paths), st)
+}
+
+fn signature_of(root: &Path, st: &str, paths: &[String]) -> String {
+    let mut sig = st.to_string();
     for p in paths {
         let m = std::fs::metadata(root.join(p)).ok();
         sig += &format!("{:?}", m.map(|m| (m.modified().ok(), m.len())));
@@ -2319,5 +2474,21 @@ mod tests {
         assert_eq!(text(crop(lines.clone(), 0, 4)), ["0", "1", "2", "… 7 more"]);
         assert_eq!(text(crop(lines.clone(), 9, 4)), ["… 7 more", "7", "8", "9"]);
         assert_eq!(crop(lines, 0, 10).len(), 10);
+    }
+
+    #[test]
+    fn parses_status_v2_entries() {
+        let raw = "# branch.oid (initial)\0# branch.head main\0\
+            1 .M N... 100644 100644 100644 aa aa a b.txt\0\
+            2 R. N... 100644 100644 100644 aa aa R100 new name\0old name\0\
+            u UU N... 100644 100644 100644 100644 aa bb cc c.txt\0\
+            ? dir/new file\0";
+        let got: Vec<_> = status_entries(raw).iter().map(|e| (e.path.clone(), e.orig.clone(), e.x, e.y)).collect();
+        assert_eq!(got, [
+            ("a b.txt".into(), None, b' ', b'M'),
+            ("new name".into(), Some("old name".into()), b'R', b' '),
+            ("c.txt".into(), None, b'U', b'U'),
+            ("dir/new file".into(), None, b'?', b'?'),
+        ]);
     }
 }
