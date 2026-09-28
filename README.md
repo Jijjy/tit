@@ -2,6 +2,8 @@
 
 A minimalist, opinionated terminal UI for git.
 
+![tit: stage two files, commit, push](docs/loop.gif)
+
 tit is not a full git client. It covers the everyday loop — look at changes, stage, commit, pull, push, branch, resolve conflicts — with one obvious key for each. Messages say what happened and what to do next, not raw git errors.
 
 ## Install
