@@ -17,3 +17,8 @@ similar = "3.2.0"
 syntect = "5.3.0"
 two-face = "0.5.2"
 unicode-width = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
