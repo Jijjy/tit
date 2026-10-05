@@ -2,9 +2,10 @@ use std::{
     error::Error,
     path::{Path, PathBuf},
     collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
     process::Command,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
@@ -122,6 +123,8 @@ struct Diff {
     new: Vec<Line<'static>>,
     /// Conflict row ranges (start, len) while resolving.
     conflicts: Vec<(usize, usize)>,
+    /// `lines_cache` keys of `old` and `new`; their highlighting replaces the plain lines when it arrives.
+    keys: (u64, u64),
 }
 
 /// Part of a file with conflict markers.
@@ -585,8 +588,12 @@ struct App {
     /// Key list overlay.
     help: bool,
     msg: String,
-    ss: SyntaxSet,
-    theme: Theme,
+    ss: Arc<SyntaxSet>,
+    theme: Arc<Theme>,
+    /// Highlighted lines by hash of (path, text), so files seen before show at once.
+    lines_cache: HashMap<u64, Vec<Line<'static>>>,
+    /// Highlighting off the UI thread, as (key, lines) for old and new.
+    hl_rx: Option<Receiver<[(u64, Vec<Line<'static>>); 2]>>,
 }
 
 impl App {
@@ -640,8 +647,10 @@ impl App {
             queued: None,
             help: false,
             msg: String::new(),
-            ss: two_face::syntax::extra_newlines(),
-            theme: two_face::theme::extra().get(EmbeddedThemeName::Ansi).clone(),
+            ss: Arc::new(two_face::syntax::extra_newlines()),
+            theme: Arc::new(two_face::theme::extra().get(EmbeddedThemeName::Ansi).clone()),
+            lines_cache: HashMap::new(),
+            hl_rx: None,
         };
         // Saved in git's global config; on unless set to false.
         app.elide = app.git(&["config", "--get", "--type=bool", "tit.elide"]).map_or(true, |v| v != "false");
@@ -984,15 +993,15 @@ impl App {
     }
 
     fn load_diff(&mut self, reset_scroll: bool) {
-        self.diff = match self.entries.get(self.cur) {
-            Some(e) => self.build_diff(e),
+        self.diff = match self.entries.get(self.cur).cloned() {
+            Some(e) => self.build_diff(&e),
             None => Diff::default(),
         };
         self.vis_width = 0;
         self.jump = reset_scroll.then(|| self.diff.rows.iter().position(|r| r.2).unwrap_or(0));
     }
 
-    fn build_diff(&self, e: &Entry) -> Diff {
+    fn build_diff(&mut self, e: &Entry) -> Diff {
         let old_path = e.orig.as_deref().unwrap_or(&e.path);
         let show = |spec: String| git_bytes(&self.root, &["show", &spec]).ok();
         let (old, new) = if self.mode == Mode::Commit {
@@ -1006,7 +1015,7 @@ impl App {
         self.diff_of(old, new, &e.path)
     }
 
-    fn diff_of(&self, old: Option<Vec<u8>>, new: Option<Vec<u8>>, path: &str) -> Diff {
+    fn diff_of(&mut self, old: Option<Vec<u8>>, new: Option<Vec<u8>>, path: &str) -> Diff {
         let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
         if old.contains(&0) || new.contains(&0) {
             let l = || vec![Line::from("(binary file)")];
@@ -1039,12 +1048,44 @@ impl App {
         }
         flush(&mut rows, &mut del, &mut ins);
 
-        Diff {
-            rows,
-            old: self.highlight(&old, path),
-            new: self.highlight(&new, path),
-            conflicts: vec![],
+        // Highlighting a big file takes a noticeable time, so show it plain until it is done.
+        let key = |text: &str| {
+            let mut h = DefaultHasher::new();
+            (path, text).hash(&mut h);
+            h.finish()
+        };
+        let keys = (key(&old), key(&new));
+        let (old_lines, new_lines) = match (self.lines_cache.get(&keys.0), self.lines_cache.get(&keys.1)) {
+            (Some(o), Some(n)) => {
+                self.hl_rx = None;
+                (o.clone(), n.clone())
+            }
+            _ => {
+                let (tx, rx) = mpsc::channel();
+                let (ss, theme, path) = (self.ss.clone(), self.theme.clone(), path.to_string());
+                let (o, n) = (old.to_string(), new.to_string());
+                std::thread::spawn(move || {
+                    _ = tx.send([(keys.0, highlight(&ss, &theme, &o, &path)), (keys.1, highlight(&ss, &theme, &n, &path))])
+                });
+                self.hl_rx = Some(rx);
+                (plain(&old), plain(&new))
+            }
+        };
+        Diff { rows, old: old_lines, new: new_lines, conflicts: vec![], keys }
+    }
+
+    fn finish_highlight(&mut self, [(ko, o), (kn, n)]: [(u64, Vec<Line<'static>>); 2]) {
+        self.hl_rx = None;
+        if self.diff.keys == (ko, kn) {
+            (self.diff.old, self.diff.new) = (o.clone(), n.clone());
+            self.vis_width = 0;
         }
+        // chisle: drop everything at a cap; LRU if revisits after the cap feel slow.
+        if self.lines_cache.len() > 64 {
+            self.lines_cache.clear();
+        }
+        self.lines_cache.insert(ko, o);
+        self.lines_cache.insert(kn, n);
     }
 
     /// Side-by-side rows for a file with conflict markers: common lines on both sides,
@@ -1076,7 +1117,7 @@ impl App {
                 }
             }
         }
-        Diff { rows, old: self.highlight(&old, path), new: self.highlight(&new, path), conflicts }
+        Diff { rows, old: highlight(&self.ss, &self.theme, &old, path), new: highlight(&self.ss, &self.theme, &new, path), conflicts, ..Default::default() }
     }
 
     /// Runs `steps` in the background, showing `label…` meanwhile and `done` after.
@@ -1157,7 +1198,8 @@ impl App {
             Some((segs, left, right)) => (self.conflict_diff(&segs, &path), Some(segs), (left, right)),
             None => {
                 let show = |stage: u8| git_bytes(&self.root, &["show", &format!(":{stage}:{path}")]).ok();
-                let mut d = self.diff_of(show(2), show(3), &path);
+                let (ours, theirs) = (show(2), show(3));
+                let mut d = self.diff_of(ours, theirs, &path);
                 d.conflicts = vec![(0, d.rows.len())];
                 (d, None, ("ours".into(), "theirs".into()))
             }
@@ -1287,28 +1329,6 @@ impl App {
         }
     }
 
-    fn highlight(&self, text: &str, path: &str) -> Vec<Line<'static>> {
-        let ss = &self.ss;
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let syntax = name
-            .rsplit_once('.')
-            .and_then(|(_, ext)| ss.find_syntax_by_extension(ext))
-            .or_else(|| ss.find_syntax_by_extension(name))
-            .or_else(|| text.lines().next().and_then(|l| ss.find_syntax_by_first_line(l)))
-            .unwrap_or_else(|| ss.find_syntax_plain_text());
-        let mut h = HighlightLines::new(syntax, &self.theme);
-        LinesWithEndings::from(text)
-            .map(|l| {
-                let spans = h.highlight_line(l, ss).unwrap_or_default();
-                Line::from(
-                    spans
-                        .into_iter()
-                        .map(|(st, s)| Span::styled(s.trim_end_matches(['\n', '\r']).replace('\t', "    "), to_style(st)))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect()
-    }
 
     fn toggle(&mut self) {
         let Some(e) = self.entries.get(self.cur) else { return };
@@ -2298,7 +2318,7 @@ impl App {
         let mut checking: Option<Receiver<(String, String)>> = None;
         loop {
             term.draw(|f| self.draw(f))?;
-            let loading = self.log_rx.is_some() || self.files_rx.is_some();
+            let loading = self.log_rx.is_some() || self.files_rx.is_some() || self.hl_rx.is_some();
             let wait = if self.busy.is_some() || self.queued.is_some() || checking.is_some() || loading { 50 } else { 500 };
             // Handle every key already queued before drawing again, so held keys don't lag.
             let mut wait = Duration::from_millis(wait);
@@ -2331,6 +2351,11 @@ impl App {
                 && let Ok((sha, files)) = rx.try_recv()
             {
                 self.finish_files(sha, files);
+            }
+            if let Some(rx) = &self.hl_rx
+                && let Ok(sides) = rx.try_recv()
+            {
+                self.finish_highlight(sides);
             }
             // A failed fetch (offline, no access) just waits for the next one.
             self.start_fetch(Duration::from_secs(300));
@@ -2374,6 +2399,33 @@ fn signature_of(root: &Path, st: &str, paths: &[String]) -> String {
         sig += &format!("{:?}", m.map(|m| (m.modified().ok(), m.len())));
     }
     sig
+}
+
+fn highlight(ss: &SyntaxSet, theme: &Theme, text: &str, path: &str) -> Vec<Line<'static>> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let syntax = name
+        .rsplit_once('.')
+        .and_then(|(_, ext)| ss.find_syntax_by_extension(ext))
+        .or_else(|| ss.find_syntax_by_extension(name))
+        .or_else(|| text.lines().next().and_then(|l| ss.find_syntax_by_first_line(l)))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut h = HighlightLines::new(syntax, theme);
+    LinesWithEndings::from(text)
+        .map(|l| {
+            let spans = h.highlight_line(l, ss).unwrap_or_default();
+            Line::from(
+                spans
+                    .into_iter()
+                    .map(|(st, s)| Span::styled(s.trim_end_matches(['\n', '\r']).replace('\t', "    "), to_style(st)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+/// `text` as unstyled lines, line for line as `highlight` gives them.
+fn plain(text: &str) -> Vec<Line<'static>> {
+    LinesWithEndings::from(text).map(|l| Line::from(l.trim_end_matches(['\n', '\r']).replace('\t', "    "))).collect()
 }
 
 /// Splits a line into pieces at most `width` columns wide.
