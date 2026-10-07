@@ -512,6 +512,8 @@ const LAYOUTS: [(Layout, &str, &str); 3] =
 /// One screen line of the diff: left, right, and their backgrounds.
 /// No right side means the line spans the full width (unified).
 type VisRow = (Line<'static>, Option<Line<'static>>, Option<Color>, Option<Color>);
+/// Highlighted old and new sides of a diff, each with the key it was made for.
+type Highlighted = [(u64, Vec<Line<'static>>); 2];
 
 /// Highlighted old and new text, each with its cache key.
 type Highlighted = [(u64, Vec<Line<'static>>); 2];
