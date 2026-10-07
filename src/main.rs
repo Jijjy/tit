@@ -512,6 +512,8 @@ const LAYOUTS: [(Layout, &str, &str); 3] =
 /// One screen line of the diff: left, right, and their backgrounds.
 /// No right side means the line spans the full width (unified).
 type VisRow = (Line<'static>, Option<Line<'static>>, Option<Color>, Option<Color>);
+/// Highlighted old and new sides of a diff, each with the key it was made for.
+type Highlighted = [(u64, Vec<Line<'static>>); 2];
 
 struct App {
     root: PathBuf,
@@ -593,7 +595,7 @@ struct App {
     /// Highlighted lines by hash of (path, text), so files seen before show at once.
     lines_cache: HashMap<u64, Vec<Line<'static>>>,
     /// Highlighting off the UI thread, as (key, lines) for old and new.
-    hl_rx: Option<Receiver<[(u64, Vec<Line<'static>>); 2]>>,
+    hl_rx: Option<Receiver<Highlighted>>,
 }
 
 impl App {
@@ -1074,7 +1076,7 @@ impl App {
         Diff { rows, old: old_lines, new: new_lines, conflicts: vec![], keys }
     }
 
-    fn finish_highlight(&mut self, [(ko, o), (kn, n)]: [(u64, Vec<Line<'static>>); 2]) {
+    fn finish_highlight(&mut self, [(ko, o), (kn, n)]: Highlighted) {
         self.hl_rx = None;
         if self.diff.keys == (ko, kn) {
             (self.diff.old, self.diff.new) = (o.clone(), n.clone());
